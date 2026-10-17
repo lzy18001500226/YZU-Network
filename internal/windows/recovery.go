@@ -19,10 +19,13 @@ func NetworkStatus(ctx context.Context) (string, error) {
 }
 
 // RenewDHCP requests a fresh lease without forcibly disconnecting an adapter.
-func RenewDHCP(ctx context.Context) error {
-	out, err := exec.CommandContext(ctx, "ipconfig", "/renew").CombinedOutput()
+func RenewDHCP(ctx context.Context, interfaceAlias string) error {
+	if strings.TrimSpace(interfaceAlias) == "" {
+		return fmt.Errorf("interface alias is required")
+	}
+	out, err := exec.CommandContext(ctx, "ipconfig", "/renew", interfaceAlias).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("ipconfig /renew: %w: %s", err, compactOutput(out))
+		return fmt.Errorf("ipconfig /renew %q: %w: %s", interfaceAlias, err, compactOutput(out))
 	}
 	return nil
 }

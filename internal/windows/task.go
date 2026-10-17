@@ -30,12 +30,10 @@ func InstallRepeatTask(exePath, envPath string) error {
 	}
 	args := fmt.Sprintf(`"%s" -once -e "%s"`, exePath, envPath)
 	return runSchTasks("/Create", "/F",
-		"/SC", "DAILY",
+		"/SC", "HOURLY",
 		"/TN", TaskName+"-Repeat",
 		"/TR", args,
-		"/ST", "00:00",
-		"/RI", "480",
-		"/DU", "24:00",
+		"/MO", "1",
 		"/RU", currentUser())
 }
 

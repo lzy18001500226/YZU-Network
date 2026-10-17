@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -35,7 +36,7 @@ func main() {
 		if err := win.InstallRepeatTask(exe, absEnv); err != nil {
 			log.Fatalf("install repeat task: %v", err)
 		}
-		log.Printf("installed Windows tasks: %s and %s-Repeat", win.TaskName, win.TaskName)
+		log.Printf("installed Windows tasks: %s and %s-Repeat (one hourly check)", win.TaskName, win.TaskName)
 		return
 	}
 
@@ -60,17 +61,17 @@ func main() {
 		return
 	}
 
-	log.Printf("YZU-WLAN auto login started, ssid=%q service=%q once=%v", cfg.TargetSSID, cfg.Service, *once)
+	log.Printf("YZU-WLAN auto login started, service=%q once=%v", cfg.Service, *once)
 	consecutiveFailures := 0
 	lastRecovery := time.Time{}
 	for {
-		err := runCycle(context.Background(), cfg)
+		campusInterface, err := runCycle(context.Background(), cfg)
 		if err != nil {
 			consecutiveFailures++
 			log.Printf("cycle failed: %v", err)
-			if shouldRecoverNetwork(cfg, consecutiveFailures, lastRecovery) {
+			if campusInterface != "" && shouldRecoverNetwork(cfg, consecutiveFailures, lastRecovery) {
 				lastRecovery = time.Now()
-				recoverNetwork(cfg, consecutiveFailures)
+				recoverNetwork(cfg, consecutiveFailures, campusInterface)
 			}
 		} else {
 			consecutiveFailures = 0
@@ -89,7 +90,7 @@ func shouldRecoverNetwork(cfg config.Config, failures int, lastRecovery time.Tim
 	return lastRecovery.IsZero() || time.Since(lastRecovery) >= cfg.RecoveryCooldown
 }
 
-func recoverNetwork(cfg config.Config, failures int) {
+func recoverNetwork(cfg config.Config, failures int, campusInterface string) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.RecoveryTimeout)
 	defer cancel()
 
@@ -99,7 +100,7 @@ func recoverNetwork(cfg config.Config, failures int) {
 		log.Printf("network recovery after %d consecutive failures: %s", failures, status)
 	}
 
-	if err := win.RenewDHCP(ctx); err != nil {
+	if err := win.RenewDHCP(ctx, campusInterface); err != nil {
 		log.Printf("network recovery: DHCP renew failed: %v", err)
 		return
 	}
@@ -125,45 +126,142 @@ func setupLogging(path string) {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 }
 
-func runCycle(ctx context.Context, cfg config.Config) error {
-	if !cfg.DisableWiFiStep {
-		wifiCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.WiFiRetries+1)*cfg.WiFiRetryDelay+10*time.Second)
-		ok, current, err := win.WaitForWiFi(wifiCtx, cfg.TargetSSID, cfg.WiFiRetries, cfg.WiFiRetryDelay)
-		cancel()
+type campusPathClient interface {
+	TestConnection(checkURL, checkHost string) bool
+	GetPortalURL() (string, error)
+	OldLoginService(portalURL, userID, password, service string) error
+}
+
+type campusPathDetector func(context.Context, []string, []string) ([]win.CampusInterface, error)
+type campusPathClientFactory func(interfaceName string) (campusPathClient, error)
+
+func runCycle(ctx context.Context, cfg config.Config) (string, error) {
+	return runCycleWith(ctx, cfg, win.DetectCampusInterfaces, func(interfaceName string) (campusPathClient, error) {
+		return campusnet.NewOnInterface(cfg.CheckTimeout, cfg.UserAgent, interfaceName)
+	})
+}
+
+func runCycleWith(ctx context.Context, cfg config.Config, detect campusPathDetector, newClient campusPathClientFactory) (string, error) {
+	campusInterfaces, err := detect(ctx, cfg.CampusCIDRs, cfg.CampusSSIDs)
+	if err != nil {
+		return "", err
+	}
+	if len(campusInterfaces) == 0 {
+		return "", fmt.Errorf("no connected interface matches campus CIDRs %v or SSIDs %v; no campus login attempted", cfg.CampusCIDRs, cfg.CampusSSIDs)
+	}
+
+	type campusPath struct {
+		path       win.CampusInterface
+		client     campusPathClient
+		needsLogin bool
+	}
+	clients := make([]campusPath, 0, len(campusInterfaces))
+	var setupFailures []error
+	for _, path := range campusInterfaces {
+		client, err := newClient(path.Name)
 		if err != nil {
-			return fmt.Errorf("check WiFi: %w", err)
+			log.Printf("skip campus interface %q: %v", path.Name, err)
+			setupFailures = append(setupFailures, fmt.Errorf("interface %q: %w", path.Name, err))
+			continue
 		}
-		if !ok {
-			return fmt.Errorf("target WiFi not connected: current=%q target=%q", current, cfg.TargetSSID)
+		log.Printf("campus path detected: interface=%q IPv4=%s via=%s", path.Name, path.IPv4, path.Reason)
+		clients = append(clients, campusPath{path: path, client: client})
+	}
+	if len(clients) == 0 {
+		if len(setupFailures) > 0 {
+			return "", errors.Join(setupFailures...)
 		}
+		return "", fmt.Errorf("no usable campus interface has an IPv4 address")
 	}
 
-	client := campusnet.New(cfg.CheckTimeout, cfg.UserAgent)
-	if !cfg.Debug && client.TestConnection(cfg.CheckURL, cfg.CheckHost) {
-		log.Printf("internet is available")
-		return nil
+	loginNeeded := false
+	for i := range clients {
+		if !cfg.Debug && clients[i].client.TestConnection(cfg.CheckURL, cfg.CheckHost) {
+			log.Printf("internet is available through %q", clients[i].path.Name)
+			continue
+		}
+		clients[i].needsLogin = true
+		loginNeeded = true
+	}
+	if !loginNeeded {
+		if len(setupFailures) > 0 {
+			return "", errors.Join(setupFailures...)
+		}
+		return "", nil
 	}
 
-	log.Printf("internet unavailable, login starts after %s", cfg.StartDelay)
+	log.Printf("internet unavailable on one or more campus paths, login starts after %s", cfg.StartDelay)
+	pendingInterface := ""
+	for _, candidate := range clients {
+		if candidate.needsLogin {
+			pendingInterface = candidate.path.Name
+			break
+		}
+	}
 	select {
 	case <-time.After(cfg.StartDelay):
 	case <-ctx.Done():
-		return ctx.Err()
+		return pendingInterface, ctx.Err()
 	}
 
-	if err := client.Login(cfg.Username, cfg.Password, cfg.Service); err != nil {
-		time.Sleep(cfg.RetryInterval)
-		return fmt.Errorf("campusnet login: %w", err)
+	var loginFailures []error
+	recoveryInterface := ""
+	for _, candidate := range clients {
+		if !candidate.needsLogin {
+			continue
+		}
+		if !cfg.Debug && candidate.client.TestConnection(cfg.CheckURL, cfg.CheckHost) {
+			log.Printf("internet became available through %q before login", candidate.path.Name)
+			continue
+		}
+
+		portalURL, err := candidate.client.GetPortalURL()
+		if err != nil {
+			log.Printf("campus portal unavailable through %q: %v", candidate.path.Name, err)
+			loginFailures = append(loginFailures, fmt.Errorf("interface %q: get portal URL: %w", candidate.path.Name, err))
+			if recoveryInterface == "" {
+				recoveryInterface = candidate.path.Name
+			}
+			continue
+		}
+		if err := candidate.client.OldLoginService(portalURL, cfg.Username, cfg.Password, cfg.Service); err != nil {
+			log.Printf("campusnet login failed through %q: %v", candidate.path.Name, err)
+			loginFailures = append(loginFailures, fmt.Errorf("interface %q: campusnet login: %w", candidate.path.Name, err))
+			if recoveryInterface == "" {
+				recoveryInterface = candidate.path.Name
+			}
+			continue
+		}
+		if candidate.client.TestConnection(cfg.CheckURL, cfg.CheckHost) {
+			log.Printf("login verified through %q", candidate.path.Name)
+			continue
+		}
+		log.Printf("login through %q did not restore internet access", candidate.path.Name)
+		loginFailures = append(loginFailures, fmt.Errorf("interface %q: login request succeeded but internet check still failed", candidate.path.Name))
+		if recoveryInterface == "" {
+			recoveryInterface = candidate.path.Name
+		}
 	}
-	if client.TestConnection(cfg.CheckURL, cfg.CheckHost) {
-		log.Printf("login verified")
-		return nil
+
+	cycleFailures := append(setupFailures, loginFailures...)
+	if len(cycleFailures) > 0 {
+		return recoveryInterface, errors.Join(cycleFailures...)
 	}
-	return fmt.Errorf("login request succeeded but internet check still failed")
+	return "", nil
 }
 
 func logoutDevices(cfg config.Config) error {
-	self := campusnet.NewSelfService(cfg.CheckTimeout, cfg.UserAgent)
+	campusInterfaces, err := win.DetectCampusInterfaces(context.Background(), cfg.CampusCIDRs, cfg.CampusSSIDs)
+	if err != nil {
+		return err
+	}
+	if len(campusInterfaces) == 0 {
+		return fmt.Errorf("no connected campus interface detected")
+	}
+	self, err := campusnet.NewSelfServiceOnInterface(cfg.CheckTimeout, cfg.UserAgent, campusInterfaces[0].Name)
+	if err != nil {
+		return fmt.Errorf("select campus interface %q: %w", campusInterfaces[0].Name, err)
+	}
 	if err := self.Login(cfg.Username, cfg.Password); err != nil {
 		return err
 	}

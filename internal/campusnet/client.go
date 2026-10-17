@@ -33,6 +33,23 @@ func New(timeout time.Duration, userAgent string) *Client {
 	}
 }
 
+func NewOnInterface(timeout time.Duration, userAgent, interfaceName string) (*Client, error) {
+	transport, err := newInterfaceTransport(timeout, interfaceName)
+	if err != nil {
+		return nil, err
+	}
+	jar, _ := cookiejar.New(nil)
+	return &Client{
+		httpClient: &http.Client{
+			Timeout:   timeout,
+			Jar:       jar,
+			Transport: transport,
+		},
+		userAgent: userAgent,
+		timeout:   timeout,
+	}, nil
+}
+
 func (c *Client) TestConnection(checkURL, checkHost string) bool {
 	req, err := http.NewRequest(http.MethodGet, checkURL, nil)
 	if err != nil {
@@ -44,7 +61,8 @@ func (c *Client) TestConnection(checkURL, checkHost string) bool {
 	}
 
 	checkClient := &http.Client{
-		Timeout: c.timeout,
+		Timeout:   c.timeout,
+		Transport: c.httpClient.Transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

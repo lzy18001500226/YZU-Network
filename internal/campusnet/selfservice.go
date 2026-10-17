@@ -34,6 +34,22 @@ func NewSelfService(timeout time.Duration, userAgent string) *SelfService {
 	}
 }
 
+func NewSelfServiceOnInterface(timeout time.Duration, userAgent, interfaceName string) (*SelfService, error) {
+	transport, err := newInterfaceTransport(timeout, interfaceName)
+	if err != nil {
+		return nil, err
+	}
+	jar, _ := cookiejar.New(nil)
+	return &SelfService{
+		httpClient: &http.Client{
+			Timeout:   timeout,
+			Jar:       jar,
+			Transport: transport,
+		},
+		userAgent: userAgent,
+	}, nil
+}
+
 func (s *SelfService) Login(username, password string) error {
 	form := url.Values{
 		"name":     {username},

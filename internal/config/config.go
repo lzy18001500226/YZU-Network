@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -14,22 +15,19 @@ type Config struct {
 	Username         string
 	Password         string
 	Service          string
-	TargetSSID       string
+	CampusCIDRs      []string
+	CampusSSIDs      []string
 	CheckURL         string
 	CheckHost        string
 	UserAgent        string
 	CheckInterval    time.Duration
 	StartDelay       time.Duration
-	RetryInterval    time.Duration
 	CheckTimeout     time.Duration
-	WiFiRetries      int
-	WiFiRetryDelay   time.Duration
 	RecoveryFailures int
 	RecoveryCooldown time.Duration
 	RecoveryTimeout  time.Duration
 	Debug            bool
 	LogFile          string
-	DisableWiFiStep  bool
 }
 
 func Load(path string) (Config, error) {
@@ -54,23 +52,20 @@ func Load(path string) (Config, error) {
 		Username:         get("SSO_USERNAME", ""),
 		Password:         get("SSO_PASSWORD", ""),
 		Service:          get("CAMPUSNET_SERVICE", "学校互联网服务"),
-		TargetSSID:       get("TARGET_SSID", "YZU-WLAN"),
+		CampusCIDRs:      parseList(get("CAMPUS_CIDRS", "10.135.0.0/17")),
+		CampusSSIDs:      parseList(get("CAMPUS_SSIDS", "")),
 		CheckURL:         get("CHECK_URL", "http://111.13.141.31/generate_204"),
 		CheckHost:        get("CHECK_HOST", "connect.rom.miui.com"),
 		UserAgent:        get("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"),
 		CheckInterval:    parseDuration(get("CHECK_INTERVAL", "60s"), 60*time.Second),
 		StartDelay:       parseDuration(get("START_DELAY", "5s"), 5*time.Second),
-		RetryInterval:    parseDuration(get("RETRY_INTERVAL", "30s"), 30*time.Second),
 		CheckTimeout:     parseDuration(get("CHECK_TIMEOUT", "5s"), 5*time.Second),
-		WiFiRetries:      parseInt(get("WIFI_RETRIES", "5"), 5),
-		WiFiRetryDelay:   parseDuration(get("WIFI_RETRY_DELAY", "3s"), 3*time.Second),
 		RecoveryFailures: parseInt(get("RECOVERY_FAILURES", "5"), 5),
 		RecoveryCooldown: parseDuration(get("RECOVERY_COOLDOWN", "10m"), 10*time.Minute),
 		RecoveryTimeout:  parseDuration(get("RECOVERY_TIMEOUT", "45s"), 45*time.Second),
 		Debug:            parseBool(get("DEBUG", "false")),
 		LogFile:          os.ExpandEnv(get("LOG_FILE", "yzu-wlan.log")),
 	}
-	cfg.DisableWiFiStep = parseBool(get("DISABLE_WIFI_STEP", "false"))
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -88,8 +83,13 @@ func (c Config) Validate() error {
 	if c.Service == "" {
 		return errors.New("CAMPUSNET_SERVICE is required")
 	}
-	if !c.DisableWiFiStep && c.TargetSSID == "" {
-		return errors.New("TARGET_SSID is required unless DISABLE_WIFI_STEP=true")
+	if len(c.CampusCIDRs)+len(c.CampusSSIDs) == 0 {
+		return errors.New("at least one CAMPUS_CIDRS or CAMPUS_SSIDS entry is required")
+	}
+	for _, cidr := range c.CampusCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid CAMPUS_CIDRS entry %q: %w", cidr, err)
+		}
 	}
 	if c.CheckURL == "" {
 		return errors.New("CHECK_URL is required")
@@ -162,4 +162,15 @@ func parseBool(value string) bool {
 	default:
 		return false
 	}
+}
+
+func parseList(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if item := strings.TrimSpace(part); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }
